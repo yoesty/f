@@ -1,0 +1,159 @@
+import os
+import uuid
+import whisper
+import vlc
+import torch
+from moviepy.editor import VideoFileClip
+from typing import List, Dict
+from pydantic import BaseModel
+import ffmpeg
+
+class SubtitleGenerator:
+    def __init__(self, model_size='large'):
+        """
+        Initialize the subtitle generator with a specified Whisper model size.
+        
+        Args:
+            model_size (str): Size of the Whisper model ('tiny', 'base', 'small', 'medium', 'large')
+        """
+        # Check GPU availability
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Load Whisper model
+        self.model = whisper.load_model(model_size, device=self.device)
+    
+    def split_large_video(self, video_path: str, max_duration: int = 3600) -> List[str]:
+        """
+        Split large videos into manageable chunks for processing.
+        
+        Args:
+            video_path (str): Path to the input video
+            max_duration (int): Maximum chunk duration in seconds
+        
+        Returns:
+            List of temporary video chunk paths
+        """
+        video = VideoFileClip(video_path)
+        total_duration = video.duration
+        chunks = []
+        
+        for start in range(0, int(total_duration), max_duration):
+            end = min(start + max_duration, int(total_duration))
+            chunk_path = f"temp_chunk_{uuid.uuid4()}.mp4"
+            
+            (
+                ffmpeg
+                .input(video_path, ss=start, t=end-start)
+                .output(chunk_path, c='copy')
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True)
+            )
+            chunks.append(chunk_path)
+        
+        return chunks
+    
+    def generate_subtitles(self, video_path: str, output_format: str = 'srt') -> str:
+        """
+        Generate subtitles for a video using Whisper AI.
+        
+        Args:
+            video_path (str): Path to the input video
+            output_format (str): Subtitle output format ('srt', 'vtt')
+        
+        Returns:
+            Path to the generated subtitle file
+        """
+        # Handle very large videos by splitting
+        if VideoFileClip(video_path).duration > 3600:  # Over 1 hour
+            video_chunks = self.split_large_video(video_path)
+            all_subtitles = []
+            
+            for chunk in video_chunks:
+                result = self.model.transcribe(
+                    chunk, 
+                    verbose=False, 
+                    language='en',
+                    fp16=self.device == 'cuda'
+                )
+                all_subtitles.extend(result['segments'])
+                os.remove(chunk)  # Clean up temporary chunk
+            
+            # Sort subtitles by start time
+            all_subtitles.sort(key=lambda x: x['start'])
+        else:
+            # Process smaller videos directly
+            result = self.model.transcribe(
+                video_path, 
+                verbose=False, 
+                language='en',
+                fp16=self.device == 'cuda'
+            )
+            all_subtitles = result['segments']
+        
+        # Generate subtitle file
+        subtitle_path = f"subtitles_{uuid.uuid4()}.{output_format}"
+        with open(subtitle_path, 'w', encoding='utf-8') as f:
+            for i, segment in enumerate(all_subtitles, 1):
+                start = self._format_time(segment['start'])
+                end = self._format_time(segment['end'])
+                text = segment['text'].strip()
+                
+                if output_format == 'srt':
+                    f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+                elif output_format == 'vtt':
+                    f.write(f"{start} --> {end}\n{text}\n\n")
+        
+        return subtitle_path
+    
+    def _format_time(self, seconds: float) -> str:
+        """
+        Convert seconds to subtitle time format.
+        
+        Args:
+            seconds (float): Time in seconds
+        
+        Returns:
+            Formatted time string
+        """
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
+
+class VideoSubtitleApp:
+    def __init__(self):
+        self.subtitle_generator = SubtitleGenerator()
+    
+    def process_video(self, video_path: str, output_format: str = 'srt'):
+        """
+        Main method to process video and generate subtitles
+        
+        Args:
+            video_path (str): Path to input video
+            output_format (str): Subtitle output format
+        
+        Returns:
+            Subtitle file path
+        """
+        try:
+            # Validate video duration
+            video = VideoFileClip(video_path)
+            if video.duration > 99 * 3600:  # More than 99 hours
+                raise ValueError("Video exceeds maximum supported duration")
+            
+            # Generate subtitles
+            subtitle_path = self.subtitle_generator.generate_subtitles(
+                video_path, 
+                output_format
+            )
+            
+            return subtitle_path
+        
+        except Exception as e:
+            print(f"Error processing video: {e}")
+            return None
+
+# Example Usage
+if __name__ == "__main__":
+    app = VideoSubtitleApp()
+    subtitle_file = app.process_video("long_video.mp4")
+    print(f"Subtitles generated: {subtitle_file}")
